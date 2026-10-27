@@ -8,6 +8,8 @@ and health alerts (chatty devices, non-255 TTL → reflected/proxied traffic).
 Built for UniFi deployments with heavy mDNS device fleets (Sonos, Apple TV,
 smart TVs, Josh.ai).
 
+![dashboard](docs/img/dashboard.png)
+
 ## Architecture
 
 ```
@@ -63,17 +65,32 @@ INTERFACE=br20 COLLECTOR_URL=http://<collector>:8053 docker run --net=host ...
 ## What the dashboard shows
 
 - **Rates** — mDNS packets/sec now and trend (queries vs responses/min).
-- **Top talkers** — devices generating the most mDNS traffic. Devices sending
-  packets with IP TTL ≠ 255 are highlighted — that means the packet was routed
-  (e.g. by the UniFi mDNS proxy) rather than native multicast, or the sender
-  isn't RFC-compliant.
+- **Top talkers** — devices generating the most mDNS traffic, annotated with
+  UniFi client names/AP when enrichment is on. Devices sending with IP
+  TTL ≠ 255 are flagged — routed/re-originated rather than native multicast.
 - **Service catalog** — every advertised instance (`_airplay._tcp`, `_sonos._tcp`,
-  …) with its host, port, addresses, VLAN, and last-seen time.
+  …) with host, port, addresses, VLAN, last-seen. Rows show **stale** when a
+  record ages past its TTL (device vanished) and **goodbye** when it left
+  gracefully — the "shut off politely vs. crashed" distinction.
 - **Top queried names** — what devices are looking for; "unknown" marks queries
-  for names no service advertises (classic discovery-failure symptom).
-- **Alerts** — chatty devices (>5 pps sustained), non-255 TTL sources, and
-  hot queries with no known advertiser.
+  no service answers (classic discovery-failure symptom).
+- **Multicast groups** — live estimate of who belongs to 224.0.0.251,
+  239.255.255.250 and other groups, per VLAN — from IGMP/MLD reports.
+- **Joins / leaves** — IGMP+MLD membership feed (join, leave, query).
+- **UPnP / SSDP devices** — per-USN catalog: every service type each device
+  advertises, description URL, server string, Sonos `X-RINCON` household IDs,
+  and whether it sent `ssdp:byebye`.
+- **SSDP activity** — M-SEARCH, NOTIFY, and response feed — "did the
+  controller's search get answered?"
+- **Goodbyes** — graceful departures: mDNS TTL=0 records and `ssdp:byebye`.
+- **Alerts** — chatty devices (>5 pps), name conflicts (two devices claiming
+  one instance, with each claimant's IP/MAC/VLAN), reflector loops (proxy
+  echoing onto the origin VLAN), proxied/re-originated traffic summaries,
+  unanswered query storms, and TTL anomalies with native-vs-reflected
+  correlation.
 - **Activity** — live packet feed.
+- **UniFi status pill** — header shows enrichment health: client count and
+  poll age, or the concrete error when it can't reach the controller.
 
 ## Local demo (no real LAN needed)
 
@@ -132,10 +149,20 @@ Set `DB_PATH=/tmp/mdns.db` to keep the demo DB out of the way.
 | `UNIFI_SITE` | collector | default | controller site name |
 | `UNIFI_POLL_SECONDS` | collector | 60 | how often to refresh the client list |
 
-UniFi enrichment is optional: with `UNIFI_HOST`+`UNIFI_API_KEY` set, the
-collector polls the Network API (`stat/sta`) and labels talkers, group
-members, UPnP devices and goodbyes with each client's UniFi name and
-AP/switch. Without them everything still works, just unlabeled.
+UniFi enrichment is optional. With credentials set, the collector polls the
+controller and labels talkers, group members, UPnP devices and goodbyes with
+each client's UniFi name and AP/switch — and a status pill in the dashboard
+header shows whether the poll is working. Two auth modes, tried in order:
+
+- `UNIFI_API_KEY` — keys from Settings → Control Plane → Integrations. These
+  authenticate the official Integration API
+  (`/proxy/network/integration/v1/`); the same key is also tried against the
+  classic `stat/sta` endpoint. Needs recent UniFi OS/Network app.
+- `UNIFI_USER` / `UNIFI_PASS` — a local (non-MFA) controller account logs in
+  and the classic API is used. Works on every firmware; a "View only" local
+  admin is enough.
+
+Without credentials everything still works, just unlabeled.
 
 ## Testing
 
@@ -144,11 +171,30 @@ AP/switch. Without them everything still works, just unlabeled.
 procedures for Sonos/IoT discovery problems (missing speakers, unanswered
 M-SEARCHes, graceful-vs-crash departures, IGMP membership flaps).
 
+## API
+
+`/api/summary` · `/api/timeseries` · `/api/talkers` · `/api/services` ·
+`/api/questions` · `/api/activity` · `/api/igmp` · `/api/memberships` ·
+`/api/ssdp` · `/api/upnp` · `/api/goodbyes` · `/api/alerts` ·
+`/api/reflectors` · `/api/unifi` · `POST /api/events` (sensor ingest)
+
+## Project layout
+
+```
+sensor/sensor.py            AF_PACKET capture + parsers (mDNS/IGMP/MLD/SSDP)
+collector/app.py            FastAPI + SQLite: ingest, retention, API, alerts
+collector/unifi.py          UniFi controller enrichment client
+collector/static/index.html dashboard (no build step, no CDN)
+tools/simulator.py          synthetic traffic generator for demos/tests
+tests/                      parser unit tests
+deploy/docker-compose.yml   standalone pull-only deploy file
+```
+
 ## Roadmap hooks
 
 - Propagation matrix: correlate service announcements across VLAN sensors to
-  verify the UniFi mDNS proxy is actually reflecting each service (and detect
-  reflector loops — same packet seen on N VLANs).
+  verify the UniFi mDNS proxy reflects each service (the same-VLAN
+  reflector_loop case already alerts).
 - UniFi per-port multicast counters to spot flooding vs. IGMP-snooping
   confinement (enrichment already pulls client names/AP/port).
 - Query↔response correlation: "device X asked for Y and never saw an answer."
