@@ -464,16 +464,43 @@ def alerts():
             "kind": "chatty_device",
             "detail": f"{r['src_ip']} ({r['src_mac']}) sent {r['n']} mDNS packets in the last minute",
         })
-    # non-255 IP TTL → routed/reflected (or non-compliant) traffic
+    # reflector detection: a MAC that announced many distinct RR names in the
+    # window is almost certainly the gateway's mDNS proxy re-originating
+    # traffic, not a real device. Excluded from conflict counting and used to
+    # explain TTL anomalies.
+    reflectors = {r[0] for r in c.execute(
+        "SELECT src_mac FROM answers WHERE ts > ? GROUP BY src_mac HAVING COUNT(DISTINCT name) >= 8",
+        (now - 600,),
+    )}
+    # non-255 IP TTL → routed/reflected (or non-compliant) traffic. L2 switches
+    # never touch TTL, so either the stack is non-compliant or the packet was
+    # re-originated by a router/proxy.
     for r in c.execute(
-        """SELECT src_ip, COUNT(*) n, ROUND(AVG(ip_ttl),1) ttl FROM packets
+        """SELECT src_ip, MAX(src_mac) src_mac, COUNT(*) n,
+                  MIN(ip_ttl) lo, MAX(ip_ttl) hi FROM packets
            WHERE ts > ? AND ip_ttl != 255 GROUP BY src_ip ORDER BY n DESC LIMIT 10""",
         (now - 600,),
     ):
+        native = c.execute(
+            "SELECT 1 FROM packets WHERE src_ip=? AND ip_ttl=255 AND ts > ? LIMIT 1",
+            (r["src_ip"], now - 600),
+        ).fetchone()
+        if r["src_mac"] in reflectors:
+            why = ("this source announces many unrelated services — almost certainly "
+                   "your UniFi mDNS proxy re-originating other VLANs' traffic, which is expected")
+            sev = "info"
+        elif native:
+            why = ("it also sends TTL=255 packets natively → the device itself has a "
+                   "non-RFC-compliant stack (TTL is only decremented by routers)")
+            sev = "medium"
+        else:
+            why = ("no TTL=255 packets seen from this source → the traffic is re-originated "
+                   "(reflected/proxied across a router) rather than native multicast")
+            sev = "medium"
         out.append({
-            "severity": "medium",
+            "severity": sev,
             "kind": "ttl_not_255",
-            "detail": f"{r['src_ip']} sent {r['n']} packets with avg IP TTL {r['ttl']} (not 255 → likely reflected/proxied or non-RFC-compliant)",
+            "detail": f"{r['src_ip']} ({r['src_mac']}) sent {r['n']} mDNS packets at IP TTL {r['lo']}–{r['hi']}; {why}",
         })
     # unicast-destined mdns to port 5353 is fine; flag storms of queries with no answers
     for r in c.execute(
@@ -490,18 +517,35 @@ def alerts():
                 "kind": "unanswered_queries",
                 "detail": f"'{r['name']}' queried {r['n']} times by {r['askers']} device(s) in 10 min with no known service advertising it",
             })
-    # name conflicts: the same PTR instance name advertised by >1 MAC
+    # name conflicts: the same PTR instance name advertised by >1 distinct
+    # source. Sources that look like the reflector don't count — reflected
+    # copies always carry the gateway's MAC, which would false-positive on
+    # every service it mirrors. Only ≥2 real sources is a genuine conflict
+    # (two devices claiming one friendly name, e.g. duplicate AirPlay names).
     for r in c.execute(
-        """SELECT rdata, COUNT(DISTINCT src_mac) macs, GROUP_CONCAT(DISTINCT src_ip) ips
+        """SELECT rdata, GROUP_CONCAT(DISTINCT src_mac) macs,
+                  GROUP_CONCAT(DISTINCT src_ip) ips
            FROM answers WHERE rtype='PTR' AND ts > ?
-           GROUP BY rdata HAVING macs > 1 ORDER BY macs DESC LIMIT 10""",
+           GROUP BY rdata HAVING COUNT(DISTINCT src_mac) > 1
+           ORDER BY COUNT(DISTINCT src_mac) DESC LIMIT 20""",
         (now - 600,),
     ):
-        out.append({
-            "severity": "high",
-            "kind": "name_conflict",
-            "detail": f"instance '{r['rdata']}' advertised by {r['macs']} different devices ({r['ips']}) — likely a hostname/name conflict",
-        })
+        macs = r["macs"].split(",")
+        ips = r["ips"].split(",")
+        real = [m for m in macs if m not in reflectors]
+        pairs = ", ".join(f"{ip}/{m}" for ip, m in zip(ips, macs))
+        if len(real) > 1:
+            out.append({
+                "severity": "high",
+                "kind": "name_conflict",
+                "detail": f"instance '{r['rdata']}' claimed by {len(real)} different devices ({pairs}) — two devices share one friendly name; legitimate in stereo pairs/groups, otherwise a real conflict",
+            })
+        elif len(macs) > 1:
+            out.append({
+                "severity": "info",
+                "kind": "reflector_echo",
+                "detail": f"instance '{r['rdata']}' also announced by {pairs} — matches the reflector pattern, so this is your UniFi proxy mirroring the service, not a conflict",
+            })
     return {"alerts": out, "generated_at": now}
 
 
