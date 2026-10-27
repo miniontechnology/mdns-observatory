@@ -19,6 +19,7 @@ import os
 import ssl
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 UNIFI_HOST = os.environ.get("UNIFI_HOST", "").rstrip("/")
@@ -26,7 +27,7 @@ UNIFI_API_KEY = os.environ.get("UNIFI_API_KEY", "")
 UNIFI_SITE = os.environ.get("UNIFI_SITE", "default")
 POLL_SECONDS = float(os.environ.get("UNIFI_POLL_SECONDS", "60"))
 
-_cache = {"by_mac": {}, "by_ip": {}, "updated": 0.0, "count": 0, "error": None}
+_cache = {"by_mac": {}, "by_ip": {}, "updated": 0.0, "count": 0, "error": None, "site": None}
 _lock = threading.Lock()
 
 
@@ -42,18 +43,41 @@ def _ssl_ctx():
     return ctx
 
 
+def _get(url):
+    req = urllib.request.Request(
+        url, headers={"X-API-KEY": UNIFI_API_KEY, "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=8, context=_ssl_ctx()) as r:
+        return json.loads(r.read())
+
+
+def _resolve_site():
+    """UNIFI_SITE may be the API slug ('default') or the display name
+    ('EMF UDM'). Look up self/sites once and map either to the slug."""
+    if _cache["site"]:
+        return _cache["site"]
+    for base in ("/proxy/network", ""):
+        try:
+            data = _get(f"{UNIFI_HOST}{base}/api/self/sites")
+            for s in data.get("data", []):
+                if s.get("name") == UNIFI_SITE or (s.get("desc") or "").lower() == UNIFI_SITE.lower():
+                    _cache["site"] = s["name"]
+                    return s["name"]
+            break  # list worked but no match — keep raw value
+        except Exception:
+            continue
+    return UNIFI_SITE
+
+
 def _fetch_clients():
     # UniFi OS consoles (UDM/UDR/UXG/CK) proxy the Network API at
     # /proxy/network; classic controllers serve it at the root.
+    site = urllib.parse.quote(_resolve_site(), safe="")
     last_err = None
     for base in ("/proxy/network", ""):
-        url = f"{UNIFI_HOST}{base}/api/s/{UNIFI_SITE}/stat/sta"
+        url = f"{UNIFI_HOST}{base}/api/s/{site}/stat/sta"
         try:
-            req = urllib.request.Request(
-                url, headers={"X-API-KEY": UNIFI_API_KEY, "Accept": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=8, context=_ssl_ctx()) as r:
-                return json.loads(r.read()).get("data", [])
+            return _get(url).get("data", [])
         except Exception as e:
             last_err = e
     raise last_err
