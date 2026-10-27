@@ -39,7 +39,21 @@ ETH_P_8021Q = 0x8100
 ETH_P_IP = 0x0800
 ETH_P_IPV6 = 0x86DD
 IPPROTO_UDP = 17
+IPPROTO_IGMP = 2
+IPPROTO_ICMPV6 = 58
 MDNS_PORT = 5353
+
+IGMP_TYPES = {0x11: "query", 0x12: "v1_report", 0x16: "v2_report", 0x17: "v2_leave", 0x22: "v3_report"}
+MLD_TYPES = {130: "query", 131: "v1_report", 132: "v1_done", 143: "v2_report"}
+# group-record types inside v3/v2 reports
+RECORD_ACTION = {
+    1: ("MODE_IS_INCLUDE", "join"),
+    2: ("MODE_IS_EXCLUDE", "join"),
+    3: ("CHANGE_TO_INCLUDE_MODE", "join"),
+    4: ("CHANGE_TO_EXCLUDE_MODE", "leave"),
+    5: ("ALLOW_NEW_SOURCES", "join"),
+    6: ("BLOCK_OLD_SOURCES", "leave"),
+}
 
 _running = True
 _queue = []
@@ -76,6 +90,41 @@ def rdata_summary(rr) -> str:
         return repr(rd)
 
 
+def parse_igmp(data: bytes, l4: int, is_v6: bool):
+    """Parse an IGMP (IPv4, proto 2) or MLD (ICMPv6) packet into an event."""
+    if len(data) < l4 + 8:
+        return None
+    mtype = data[l4]
+    table = MLD_TYPES if is_v6 else IGMP_TYPES
+    if mtype not in table:
+        return None
+    name = table[mtype]
+    addr_len = 16 if is_v6 else 4
+    inet = socket.inet_ntop if is_v6 else socket.inet_ntoa
+    inet_args = (socket.AF_INET6,) if is_v6 else ()
+
+    groups = []
+    if mtype in (0x22, 143):  # v3/v2 report: group records follow
+        if len(data) < l4 + 8 + 4:
+            return None
+        nrec = struct.unpack("!H", data[l4 + 8 + 2 : l4 + 8 + 4])[0]
+        pos = l4 + 8 + 4
+        for _ in range(min(nrec, 50)):
+            if len(data) < pos + 4 + addr_len:
+                break
+            rtype, auxlen, nsrc = data[pos], data[pos + 1], struct.unpack("!H", data[pos + 2 : pos + 4])[0]
+            grp = inet(*inet_args, data[pos + 4 : pos + 4 + addr_len])
+            rname, action = RECORD_ACTION.get(rtype, (f"type_{rtype}", "report"))
+            groups.append({"group": grp, "action": action, "record": rname})
+            pos += 4 + addr_len + 4 * (nsrc + auxlen)
+    else:
+        # v1/v2 style: group address sits in the header
+        grp = inet(*inet_args, data[l4 + 4 : l4 + 4 + addr_len])
+        action = {"query": "query", "v1_done": "leave", "v2_leave": "leave"}.get(name, "join")
+        groups.append({"group": grp, "action": action, "record": name})
+    return groups
+
+
 def parse_packet(data: bytes):
     """Extract an mDNS event dict from a raw Ethernet frame, or None."""
     if len(data) < 14:
@@ -92,7 +141,7 @@ def parse_packet(data: bytes):
     if ethertype == ETH_P_IP:
         ihl = (data[offset] & 0x0F) * 4
         proto = data[offset + 9]
-        if proto != IPPROTO_UDP:
+        if proto not in (IPPROTO_UDP, IPPROTO_IGMP):
             return None
         ip_ttl = data[offset + 8]
         src_ip = socket.inet_ntoa(data[offset + 12 : offset + 16])
@@ -100,7 +149,7 @@ def parse_packet(data: bytes):
         udp = offset + ihl
     elif ethertype == ETH_P_IPV6:
         proto = data[offset + 6]
-        if proto != IPPROTO_UDP:
+        if proto not in (IPPROTO_UDP, IPPROTO_ICMPV6):
             return None
         ip_ttl = data[offset + 7]  # hop limit
         src_ip = socket.inet_ntop(socket.AF_INET6, data[offset + 8 : offset + 24])
@@ -108,6 +157,21 @@ def parse_packet(data: bytes):
         udp = offset + 40
     else:
         return None
+
+    if proto in (IPPROTO_IGMP, IPPROTO_ICMPV6):
+        groups = parse_igmp(data, udp, is_v6=(ethertype == ETH_P_IPV6))
+        if not groups:
+            return None
+        return {
+            "kind": "igmp",
+            "src_mac": mac(data[6:12]),
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "ip_ttl": ip_ttl,
+            "vlan": vlan,
+            "size": len(data),
+            "groups": groups,
+        }
 
     if len(data) < udp + 8:
         return None
@@ -120,6 +184,7 @@ def parse_packet(data: bytes):
         dns = DNSRecord.parse(payload)
     except Exception:
         return {
+            "kind": "mdns",
             "parse_error": True,
             "src_mac": mac(data[6:12]),
             "src_ip": src_ip,
@@ -151,6 +216,7 @@ def parse_packet(data: bytes):
     ]
 
     return {
+        "kind": "mdns",
         "parse_error": False,
         "src_mac": mac(data[6:12]),
         "src_ip": src_ip,

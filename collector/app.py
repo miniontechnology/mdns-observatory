@@ -68,6 +68,15 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_answers_ts ON answers(ts);
             CREATE INDEX IF NOT EXISTS idx_answers_name ON answers(name);
 
+            CREATE TABLE IF NOT EXISTS igmp_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, sensor_id TEXT, vlan INTEGER,
+                src_ip TEXT, src_mac TEXT, dst_ip TEXT,
+                group_addr TEXT, action TEXT, record TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_igmp_ts ON igmp_events(ts);
+            CREATE INDEX IF NOT EXISTS idx_igmp_group ON igmp_events(group_addr);
+
             CREATE TABLE IF NOT EXISTS services (
                 instance TEXT PRIMARY KEY,
                 type TEXT, host TEXT, port INTEGER,
@@ -161,6 +170,13 @@ async def ingest(request: Request):
         for ev in events:
             ts = ev.get("ts", now)
             vlan = ev.get("vlan", 0)
+            if ev.get("kind") == "igmp":
+                for g in ev.get("groups", []):
+                    c.execute(
+                        "INSERT INTO igmp_events (ts,sensor_id,vlan,src_ip,src_mac,dst_ip,group_addr,action,record) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (ts, sensor_id, vlan, ev.get("src_ip"), ev.get("src_mac"), ev.get("dst_ip"), g["group"], g["action"], g["record"]),
+                    )
+                continue
             is_resp = 1 if ev.get("is_response") else 0
             c.execute(
                 """INSERT INTO packets
@@ -189,6 +205,7 @@ async def ingest(request: Request):
         c.execute("DELETE FROM packets WHERE ts < ?", (cutoff,))
         c.execute("DELETE FROM questions WHERE ts < ?", (cutoff,))
         c.execute("DELETE FROM answers WHERE ts < ?", (cutoff,))
+        c.execute("DELETE FROM igmp_events WHERE ts < ?", (cutoff,))
         c.commit()
     except Exception as e:
         c.rollback()
@@ -266,9 +283,11 @@ def services():
                   s.first_seen, s.last_seen, s.vlan
            FROM services s ORDER BY s.type, s.instance"""
     ).fetchall()
+    now = time.time()
     return {
         "services": [
-            {**dict(r), "addresses": json.loads(r["addresses"]) if r["addresses"] else []}
+            {**dict(r), "addresses": json.loads(r["addresses"]) if r["addresses"] else [],
+             "stale": r["last_seen"] < now - 4500}  # typical mDNS record TTL is 75min
             for r in rows
         ]
     }
@@ -309,6 +328,48 @@ def activity(limit: int = Query(50, le=500)):
         (limit,),
     ).fetchall()
     return {"activity": [dict(r) for r in rows]}
+
+
+@app.get("/api/igmp")
+def igmp(minutes: int = Query(60, le=1440)):
+    """Recent IGMP/MLD membership events (joins, leaves, queries)."""
+    c = db()
+    since = time.time() - minutes * 60
+    rows = c.execute(
+        """SELECT ts, sensor_id, vlan, src_ip, src_mac, group_addr, action, record
+           FROM igmp_events WHERE ts > ? ORDER BY ts DESC LIMIT 200""",
+        (since,),
+    ).fetchall()
+    return {"events": [dict(r) for r in rows]}
+
+
+@app.get("/api/memberships")
+def memberships():
+    """Current multicast group membership estimate: per (src_ip, group, vlan),
+    the latest event wins — join/report = member, leave = gone. SQLite's bare
+    columns ride along with the MAX(ts) row, so action/record are the latest."""
+    c = db()
+    rows = c.execute(
+        """SELECT src_ip, src_mac, group_addr, vlan, action, record,
+                  MAX(ts) last_event, COUNT(*) events
+           FROM igmp_events
+           GROUP BY src_ip, group_addr, vlan"""
+    ).fetchall()
+    groups = {}
+    left = []
+    for r in rows:
+        m = dict(r)
+        if m["action"] == "query":
+            continue  # queries come from routers, not listeners
+        if m["action"] in ("join", "report"):
+            groups.setdefault(m["group_addr"], []).append(m["src_ip"])
+        else:
+            left.append(m)
+    summary = [
+        {"group": g, "members": len(set(v)), "member_ips": sorted(set(v))}
+        for g, v in sorted(groups.items())
+    ]
+    return {"groups": summary, "left": sorted(left, key=lambda x: -x["last_event"])[:50]}
 
 
 @app.get("/api/alerts")
@@ -353,6 +414,18 @@ def alerts():
                 "kind": "unanswered_queries",
                 "detail": f"'{r['name']}' queried {r['n']} times by {r['askers']} device(s) in 10 min with no known service advertising it",
             })
+    # name conflicts: the same PTR instance name advertised by >1 MAC
+    for r in c.execute(
+        """SELECT rdata, COUNT(DISTINCT src_mac) macs, GROUP_CONCAT(DISTINCT src_ip) ips
+           FROM answers WHERE rtype='PTR' AND ts > ?
+           GROUP BY rdata HAVING macs > 1 ORDER BY macs DESC LIMIT 10""",
+        (now - 600,),
+    ):
+        out.append({
+            "severity": "high",
+            "kind": "name_conflict",
+            "detail": f"instance '{r['rdata']}' advertised by {r['macs']} different devices ({r['ips']}) — likely a hostname/name conflict",
+        })
     return {"alerts": out, "generated_at": now}
 
 

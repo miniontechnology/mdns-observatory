@@ -64,6 +64,31 @@ def mdns_socket():
     return s
 
 
+def _cksum(b: bytes) -> int:
+    if len(b) % 2:
+        b += b"\x00"
+    s = sum(struct.unpack(f"!{len(b)//2}H", b))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += s >> 16
+    return ~s & 0xFFFF
+
+
+def igmp_socket():
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IGMP)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+    return s
+
+
+def igmp(s, mtype: int, group: str, dest: str):
+    """Send an IGMPv2 membership report (0x16) or leave (0x17)."""
+    pkt = struct.pack("!BBH", mtype, 0, 0) + socket.inet_aton(group)
+    pkt = pkt[:2] + struct.pack("!H", _cksum(pkt)) + pkt[4:]
+    s.sendto(pkt, (dest, 0))
+
+
+IGMP_GROUPS = ["224.0.0.251", "239.255.255.250"]
+
+
 def send(s, record: DNSRecord):
     s.sendto(record.pack(), (MDNS_ADDR, MDNS_PORT))
 
@@ -95,14 +120,28 @@ def main():
     args = ap.parse_args()
     s = mdns_socket()
     print(f"[sim] emitting ~{args.rate} pkts/s of mDNS to {MDNS_ADDR}:{MDNS_PORT} — ctrl-c to stop")
+    try:
+        isock = igmp_socket()
+        igmp(isock, 0x16, "224.0.0.251", "224.0.0.251")  # join mDNS group
+    except PermissionError:
+        isock = None
+        print("[sim] no raw socket — skipping IGMP sim (run with sudo for IGMP)")
     # initial burst of announcements
     for d in DEVICES:
         announce(s, d)
+    n = 0
     while True:
-        if random.random() < 0.65:
+        if isock and random.random() < 0.08:
+            grp = random.choice(IGMP_GROUPS)
+            if n % 7 == 0:
+                igmp(isock, 0x17, grp, "224.0.0.2")  # occasional leave
+            else:
+                igmp(isock, 0x16, grp, grp)  # join/report
+        elif random.random() < 0.65:
             query(s)
         else:
             announce(s, random.choice(DEVICES))
+        n += 1
         time.sleep(1.0 / args.rate)
 
 

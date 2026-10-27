@@ -103,6 +103,12 @@ Set `DB_PATH=/tmp/mdns.db` to keep the demo DB out of the way.
   It only reads packets; it transmits nothing except HTTP to the collector.
 - **Collector runs non-root** inside its container (uid 1000).
 
+## What it captures
+
+- **mDNS** (UDP 5353, IPv4+IPv6): queries, responses, service announcements
+- **IGMP/MLD** (IP proto 2 / ICMPv6): membership reports, leaves, and queries —
+  the "who joined/left a multicast group" feed, including v2/v3 group records
+
 ## Config
 
 | Var | Component | Default | Purpose |
@@ -123,4 +129,6 @@ Set `DB_PATH=/tmp/mdns.db` to keep the demo DB out of the way.
   reflector loops — same packet seen on N VLANs).
 - SSDP/UPnP capture (UDP 1900 + Sonos broadcast discovery 1900/6969).
 - Goodbye-packet tracking (TTL=0 announcements) for device churn visibility.
-- IGMP/MLD snooping sanity checks.
+- UniFi controller API enrichment: MAC → device name/AP/port, and per-port
+  multicast counters to spot flooding vs. IGMP-snooping confinement.
+- Query↔response correlation: "device X asked for Y and never saw an answer."
