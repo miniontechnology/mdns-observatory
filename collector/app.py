@@ -464,17 +464,25 @@ def alerts():
             "kind": "chatty_device",
             "detail": f"{r['src_ip']} ({r['src_mac']}) sent {r['n']} mDNS packets in the last minute",
         })
-    # reflector detection: a MAC that announced many distinct RR names in the
-    # window is almost certainly the gateway's mDNS proxy re-originating
-    # traffic, not a real device. Excluded from conflict counting and used to
-    # explain TTL anomalies.
-    reflectors = {r[0] for r in c.execute(
-        "SELECT src_mac FROM answers WHERE ts > ? GROUP BY src_mac HAVING COUNT(DISTINCT name) >= 8",
-        (now - 600,),
-    )}
+    # proxy/reflector detection — three behavioral signals, no vendor claims:
+    #   a) the MAC appears on >1 VLAN (only a gateway/L3 device can),
+    #   b) it announces many distinct service names AND sends mostly TTL<255
+    #      (re-originated packets — real devices send mDNS at TTL 255),
+    #   c) it announces many names across MANY VLANs (belt & suspenders).
+    # These MACs are proxies (the UDM reflector, HomeKit hubs, other mDNS
+    # relays) and are excluded from conflict counting + labeled as proxied.
+    window = now - 600
+    many_names = {r[0] for r in c.execute(
+        "SELECT src_mac FROM answers WHERE ts > ? GROUP BY src_mac HAVING COUNT(DISTINCT name) >= 8", (window,))}
+    low_ttl = {r[0] for r in c.execute(
+        "SELECT src_mac FROM packets WHERE ts > ? GROUP BY src_mac HAVING AVG(ip_ttl) < 250", (window,))}
+    multi_vlan = {r[0] for r in c.execute(
+        "SELECT src_mac FROM packets WHERE ts > ? GROUP BY src_mac HAVING COUNT(DISTINCT vlan) > 1", (window,))}
+    reflectors = multi_vlan | (many_names & low_ttl)
     # non-255 IP TTL → routed/reflected (or non-compliant) traffic. L2 switches
     # never touch TTL, so either the stack is non-compliant or the packet was
     # re-originated by a router/proxy.
+    proxied = []
     for r in c.execute(
         """SELECT src_ip, MAX(src_mac) src_mac, COUNT(*) n,
                   MIN(ip_ttl) lo, MAX(ip_ttl) hi FROM packets
@@ -486,21 +494,24 @@ def alerts():
             (r["src_ip"], now - 600),
         ).fetchone()
         if r["src_mac"] in reflectors:
-            why = ("this source announces many unrelated services — almost certainly "
-                   "your UniFi mDNS proxy re-originating other VLANs' traffic, which is expected")
-            sev = "info"
-        elif native:
+            proxied.append(f"{r['src_ip']} ({r['src_mac']}, TTL {r['lo']}–{r['hi']}, {r['n']} pkts)")
+            continue
+        if native:
             why = ("it also sends TTL=255 packets natively → the device itself has a "
                    "non-RFC-compliant stack (TTL is only decremented by routers)")
-            sev = "medium"
         else:
             why = ("no TTL=255 packets seen from this source → the traffic is re-originated "
                    "(reflected/proxied across a router) rather than native multicast")
-            sev = "medium"
         out.append({
-            "severity": sev,
+            "severity": "medium",
             "kind": "ttl_not_255",
             "detail": f"{r['src_ip']} ({r['src_mac']}) sent {r['n']} mDNS packets at IP TTL {r['lo']}–{r['hi']}; {why}",
+        })
+    if proxied:
+        out.append({
+            "severity": "info",
+            "kind": "proxied_traffic",
+            "detail": f"{len(proxied)} source(s) re-originate multicast announcements (mDNS reflector, hub, or relay — expected infrastructure traffic): " + "; ".join(proxied),
         })
     # unicast-destined mdns to port 5353 is fine; flag storms of queries with no answers
     for r in c.execute(
@@ -600,6 +611,25 @@ def goodbyes(minutes: int = Query(120, le=1440)):
 @app.get("/api/unifi")
 def unifi_status():
     return unifi.status()
+
+
+@app.get("/api/reflectors")
+def reflector_sources():
+    """Sources that look like multicast proxies: what each suspicious MAC is,
+    how many VLANs/IPs it fronts, how many service names it announces."""
+    c = db()
+    since = time.time() - 600
+    rows = c.execute(
+        """SELECT p.src_mac, GROUP_CONCAT(DISTINCT p.src_ip) ips,
+                  COUNT(DISTINCT p.vlan) vlans, COUNT(*) pkts,
+                  ROUND(AVG(p.ip_ttl),1) avg_ttl,
+                  (SELECT COUNT(DISTINCT a.name) FROM answers a
+                    WHERE a.src_mac = p.src_mac AND a.ts > ?) names
+           FROM packets p WHERE p.ts > ?
+           GROUP BY p.src_mac HAVING names >= 3 ORDER BY names DESC""",
+        (since, since),
+    ).fetchall()
+    return {"sources": [{**dict(r), "client": unifi.lookup(mac=r["src_mac"])} for r in rows]}
 
 
 # ---------- dashboard ----------
