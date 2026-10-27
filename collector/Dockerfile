@@ -4,7 +4,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
  && useradd -r -u 1000 app && mkdir -p /data && chown app:app /data
-COPY app.py .
+COPY *.py ./
 COPY static/ static/
 
 USER app
