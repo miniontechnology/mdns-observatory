@@ -1,0 +1,32 @@
+# Standalone deploy file — no repo clone needed.
+#   1. One-time on the Synology: docker login ghcr.io -u miniontechnology
+#      (password = a GitHub PAT with read:packages scope)
+#   2. Set INTERFACE to your LAN interface (check `ip link`; often eth0 or ovs_eth0)
+#   3. docker compose up -d
+#   4. Dashboard: http://<synology-ip>:8053
+
+services:
+  collector:
+    image: ghcr.io/miniontechnology/mdns-observatory-collector:latest
+    container_name: mdns-collector
+    restart: unless-stopped
+    ports:
+      - "8053:8053"
+    volumes:
+      - collector-data:/data
+    environment:
+      CHATTY_PPS: "5"          # src sustaining >5 pps over a minute is flagged
+      RETENTION_HOURS: "72"
+
+  sensor:
+    image: ghcr.io/miniontechnology/mdns-observatory-sensor:latest
+    container_name: mdns-sensor
+    restart: unless-stopped
+    network_mode: host        # sees the host's LAN interface + multicast traffic
+    environment:
+      COLLECTOR_URL: "http://127.0.0.1:8053"   # set to http://<synology-ip>:8053 if collector runs elsewhere
+      INTERFACE: "eth0"        # Synology primary LAN interface (ovs_eth0 on bond setups)
+      SENSOR_ID: "synology"
+
+volumes:
+  collector-data:

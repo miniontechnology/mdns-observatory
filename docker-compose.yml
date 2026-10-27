@@ -1,0 +1,25 @@
+services:
+  collector:
+    build: ./collector
+    container_name: mdns-collector
+    restart: unless-stopped
+    ports:
+      - "8053:8053"
+    volumes:
+      - collector-data:/data
+    environment:
+      CHATTY_PPS: "5"          # src sustaining >5 pps over a minute is flagged
+      RETENTION_HOURS: "72"
+
+  sensor:
+    build: ./sensor
+    container_name: mdns-sensor
+    restart: unless-stopped
+    network_mode: host        # sees the host's LAN interface + multicast traffic
+    environment:
+      COLLECTOR_URL: "http://127.0.0.1:8053"   # set to http://<synology-ip>:8053 if collector runs elsewhere
+      INTERFACE: "eth0"        # Synology primary LAN interface (ovs_eth0 on bond setups)
+      SENSOR_ID: "synology"
+
+volumes:
+  collector-data:
