@@ -19,9 +19,12 @@
   main { padding: 16px 20px; display: grid; gap: 16px;
          grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
   .card { background: var(--panel); border: 1px solid var(--border);
-          border-radius: 10px; padding: 14px 16px; overflow: auto; }
+          border-radius: 10px; padding: 14px 16px; overflow-y: auto;
+          max-height: 460px; }
   .card h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase;
-             letter-spacing: .06em; color: var(--dim); }
+             letter-spacing: .06em; color: var(--dim);
+             position: sticky; top: -14px; background: var(--panel);
+             padding: 8px 0; z-index: 2; }
   .statrow { display: flex; gap: 24px; flex-wrap: wrap; }
   .stat { min-width: 90px; }
   .stat .v { font-size: 26px; font-weight: 650; }
@@ -56,7 +59,8 @@
 <header>
   <h1>mDNS Observatory</h1>
   <span class="sub" id="sensors"></span>
-  <span class="sub" style="margin-left:auto" id="updated"></span>
+  <span class="sub" style="margin-left:auto" id="unifi"></span>
+  <span class="sub" id="updated"></span>
 </header>
 
 <main>
@@ -189,17 +193,22 @@ async function j(url) { const r = await fetch(url); return r.json(); }
 
 async function refresh() {
   try {
-    const [sum, ts, tk, sv, qu, al, ac, mb, ig, sd, up, gb] = await Promise.all([
+    const [sum, ts, tk, sv, qu, al, ac, mb, ig, sd, up, gb, uf] = await Promise.all([
       j('/api/summary'), j('/api/timeseries?minutes=60'), j('/api/talkers?minutes=60'),
       j('/api/services'), j('/api/questions?minutes=30'), j('/api/alerts'),
       j('/api/activity?limit=60'), j('/api/memberships'), j('/api/igmp?minutes=60'),
       j('/api/ssdp?minutes=60'), j('/api/upnp'), j('/api/goodbyes?minutes=120'),
+      j('/api/unifi'),
     ]);
     pps1m.textContent = sum.pps_1m; pps5m.textContent = sum.pps_5m;
     talkers_count.textContent = sum.talkers_5m; nservices.textContent = sum.services_24h;
     sensors.textContent = sum.sensors.map(s =>
       `${esc(s.sensor_id)} (${esc(s.interface)}, ${s.vlans} vlan(s), last ${ago(s.last_seen)})`).join(' · ') || 'no sensors reporting';
     updated.textContent = 'updated ' + new Date().toLocaleTimeString();
+    unifi.innerHTML = !uf.enabled ? '<span class="pill" style="opacity:.6">UniFi: off</span>'
+      : uf.error ? `<span class="pill high">UniFi: ${esc(uf.error)}</span>`
+      : uf.updated ? `<span class="pill ok">UniFi: ${uf.clients} clients · ${ago(uf.updated)}</span>`
+      : '<span class="pill medium">UniFi: connecting…</span>';
     draw(ts.series);
 
     document.querySelector('#talkers').innerHTML = tk.talkers.map(t => `<tr>
