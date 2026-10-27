@@ -29,8 +29,9 @@ smart TVs, Josh.ai).
 
 **Zero-clone deploy** — grab `deploy/docker-compose.yml`, then:
 
-1. One-time: `docker login ghcr.io -u miniontechnology` with a PAT
-   (`read:packages` scope) so the NAS can pull the private images.
+1. If the GHCR packages are public, skip this. Otherwise, one-time:
+   `docker login ghcr.io -u <github-user>` with a PAT (`read:packages` scope)
+   so the NAS can pull the private images.
 2. Find the interface carrying your primary VLAN: `ip link` on the NAS —
    commonly `eth0`, or `ovs_eth0` when bonded/Open vSwitch. Set it as
    `INTERFACE` in the compose file.
