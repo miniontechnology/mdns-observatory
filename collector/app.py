@@ -5,6 +5,7 @@ Receives batched events from sensors, stores them in SQLite, and serves
 a dashboard plus JSON API.
 """
 
+import hmac
 import json
 import os
 import sqlite3
@@ -19,9 +20,13 @@ from fastapi.staticfiles import StaticFiles
 DB_PATH = os.environ.get("DB_PATH", "/data/mdns.db")
 CHATTY_PPS = float(os.environ.get("CHATTY_PPS", "5"))  # src sustaining >this pps over a minute is "chatty"
 RETENTION_HOURS = int(os.environ.get("RETENTION_HOURS", "72"))
+# Optional shared secret: when set, sensors must send it as X-Sensor-Token.
+# Leave unset on a trusted LAN to skip auth entirely.
+SENSOR_TOKEN = os.environ.get("SENSOR_TOKEN", "")
 
 app = FastAPI(title="mDNS Observatory")
 _local = threading.local()
+_write_lock = threading.Lock()
 
 
 def db() -> sqlite3.Connection:
@@ -141,6 +146,10 @@ def update_services(c, ts, sensor_id, vlan, answers):
 
 @app.post("/api/events")
 async def ingest(request: Request):
+    if SENSOR_TOKEN and not hmac.compare_digest(
+        request.headers.get("x-sensor-token", ""), SENSOR_TOKEN
+    ):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     body = await request.json()
     sensor_id = body.get("sensor_id", "unknown")
     interface = body.get("interface", "")
@@ -148,6 +157,7 @@ async def ingest(request: Request):
     c = db()
     now = time.time()
     try:
+      with _write_lock:  # one writer at a time — SQLite serializes writes anyway
         for ev in events:
             ts = ev.get("ts", now)
             vlan = ev.get("vlan", 0)

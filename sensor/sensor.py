@@ -8,6 +8,8 @@ Environment:
     COLLECTOR_URL   e.g. http://192.168.1.10:8053   (required)
     INTERFACE       interface to sniff, e.g. eth0    (required)
     SENSOR_ID       label for this sensor            (default: hostname)
+    SENSOR_TOKEN    shared secret; sent as X-Sensor-Token when the
+                    collector has SENSOR_TOKEN set     (optional)
     BATCH_SECONDS   flush interval                   (default: 2)
     BATCH_MAX       max events per flush             (default: 500)
 """
@@ -29,6 +31,8 @@ INTERFACE = os.environ["INTERFACE"]
 SENSOR_ID = os.environ.get("SENSOR_ID") or socket.gethostname()
 BATCH_SECONDS = float(os.environ.get("BATCH_SECONDS", "2"))
 BATCH_MAX = int(os.environ.get("BATCH_MAX", "500"))
+SENSOR_TOKEN = os.environ.get("SENSOR_TOKEN", "")
+_HEADERS = {"X-Sensor-Token": SENSOR_TOKEN} if SENSOR_TOKEN else {}
 
 ETH_P_ALL = 0x0003
 ETH_P_8021Q = 0x8100
@@ -176,6 +180,7 @@ def flush():
             requests.post(
                 f"{COLLECTOR_URL}/api/events",
                 json={"sensor_id": SENSOR_ID, "interface": INTERFACE, "events": batch},
+                headers=_HEADERS,
                 timeout=10,
             )
         except Exception as e:

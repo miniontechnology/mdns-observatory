@@ -84,6 +84,22 @@ python3 tools/simulator.py --rate 3 # synthetic Sonos/ATV/Josh traffic
 
 Set `DB_PATH=/tmp/mdns.db` to keep the demo DB out of the way.
 
+## Security notes
+
+- **No TLS** — sensor→collector traffic and the dashboard are plain HTTP. This
+  is designed for a trusted LAN. If you expose the collector beyond the LAN,
+  put it behind a reverse proxy with TLS and auth.
+- **Dashboard/API has no auth** — anyone on the network can read the dashboard
+  and query the API. The data is mDNS metadata only (device names, service
+  types), but treat port 8053 as LAN-only. Firewall it or bind behind a proxy
+  if that matters to you.
+- **Ingest auth is optional** — set `SENSOR_TOKEN` on both collector and
+  sensors to require an `X-Sensor-Token` header on `/api/events`. Unset = open
+  ingest (fine on a trusted LAN).
+- **Sensor privileges** — needs `network_mode: host` and `NET_RAW` to sniff.
+  It only reads packets; it transmits nothing except HTTP to the collector.
+- **Collector runs non-root** inside its container (uid 1000).
+
 ## Config
 
 | Var | Component | Default | Purpose |
@@ -91,6 +107,7 @@ Set `DB_PATH=/tmp/mdns.db` to keep the demo DB out of the way.
 | `COLLECTOR_URL` | sensor | — | where to POST events |
 | `INTERFACE` | sensor | — | interface to sniff |
 | `SENSOR_ID` | sensor | hostname | label in dashboard |
+| `SENSOR_TOKEN` | both | unset | shared secret for ingest auth (`X-Sensor-Token` header) |
 | `BATCH_SECONDS` / `BATCH_MAX` | sensor | 2 / 500 | flush tuning |
 | `CHATTY_PPS` | collector | 5 | pps threshold for chatty alert |
 | `RETENTION_HOURS` | collector | 72 | packet/question/answer retention |
