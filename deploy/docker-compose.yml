@@ -1,13 +1,17 @@
-# Standalone deploy file — no repo clone needed.
+# Deploy file — pulls prebuilt images from GHCR, no clone or local build needed.
 #   1. If the GHCR packages are public, skip to step 2. Otherwise, one-time:
 #      docker login ghcr.io -u <github-user>  (password = PAT with read:packages)
 #   2. Set INTERFACE to your LAN interface (check `ip link`; often eth0 or ovs_eth0)
 #   3. docker compose up -d
 #   4. Dashboard: http://<synology-ip>:8053
+#
+# To build from source instead (dev): uncomment the build: lines below and run
+#   docker compose up -d --build
 
 services:
   collector:
     image: ghcr.io/miniontechnology/mdns-observatory-collector:latest
+    # build: ./collector
     container_name: mdns-collector
     restart: unless-stopped
     ports:
@@ -17,9 +21,11 @@ services:
     environment:
       CHATTY_PPS: "5"          # src sustaining >5 pps over a minute is flagged
       RETENTION_HOURS: "72"
+      # SENSOR_TOKEN: ""       # optional shared secret; must match on sensors
 
   sensor:
     image: ghcr.io/miniontechnology/mdns-observatory-sensor:latest
+    # build: ./sensor
     container_name: mdns-sensor
     restart: unless-stopped
     network_mode: host        # sees the host's LAN interface + multicast traffic
@@ -27,6 +33,7 @@ services:
       COLLECTOR_URL: "http://127.0.0.1:8053"   # set to http://<synology-ip>:8053 if collector runs elsewhere
       INTERFACE: "eth0"        # Synology primary LAN interface (ovs_eth0 on bond setups)
       SENSOR_ID: "synology"
+      # SENSOR_TOKEN: ""
 
 volumes:
   collector-data:

@@ -41,8 +41,10 @@ smart TVs, Josh.ai).
 Images are built and published to GHCR automatically on every push to `main`
 (`.github/workflows/build-images.yml`).
 
-**Dev/local build** — clone the repo, edit `docker-compose.yml` (root), then
-`docker compose up -d --build`.
+**Dev/local build** — the root `docker-compose.yml` pulls published images by
+default; uncomment the `build:` lines to build from source instead
+(`docker compose up -d --build`). `deploy/docker-compose.yml` is an identical
+standalone copy for hosts that never clone the repo.
 
 The sensor only sees traffic on the VLAN(s) its interface is on. For the other
 VLANs later, either create VLAN subinterfaces on the NAS (`eth0.20` etc.) and
