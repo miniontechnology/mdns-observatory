@@ -127,7 +127,8 @@ Set `DB_PATH=/tmp/mdns.db` to keep the demo DB out of the way.
 | `RETENTION_HOURS` | collector | 72 | packet/question/answer retention |
 | `DB_PATH` | collector | /data/mdns.db | SQLite location |
 | `UNIFI_HOST` | collector | – | e.g. `https://192.168.1.1` — enables UniFi enrichment |
-| `UNIFI_API_KEY` | collector | – | UniFi OS API key (read-only) for client names/AP/port |
+| `UNIFI_API_KEY` | collector | – | Integrations-page API key → Integration API (recent firmware) |
+| `UNIFI_USER` / `UNIFI_PASS` | collector | – | local account login → classic API (any firmware) |
 | `UNIFI_SITE` | collector | default | controller site name |
 | `UNIFI_POLL_SECONDS` | collector | 60 | how often to refresh the client list |
 
