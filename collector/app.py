@@ -517,35 +517,41 @@ def alerts():
                 "kind": "unanswered_queries",
                 "detail": f"'{r['name']}' queried {r['n']} times by {r['askers']} device(s) in 10 min with no known service advertising it",
             })
-    # name conflicts: the same PTR instance name advertised by >1 distinct
-    # source. Sources that look like the reflector don't count — reflected
-    # copies always carry the gateway's MAC, which would false-positive on
-    # every service it mirrors. Only ≥2 real sources is a genuine conflict
-    # (two devices claiming one friendly name, e.g. duplicate AirPlay names).
-    for r in c.execute(
-        """SELECT rdata, GROUP_CONCAT(DISTINCT src_mac) macs,
-                  GROUP_CONCAT(DISTINCT src_ip) ips
+    # name conflicts / reflector loops: same PTR instance from >1 source,
+    # analyzed per (instance, vlan). A reflector MAC on the SAME vlan as a
+    # real source is the proxy echoing onto the segment it learned the
+    # service on — that doubles multicast on the origin VLAN (a real bug,
+    # reported as reflector_loop). A reflector MAC appearing only on OTHER
+    # vlans is the healthy cross-VLAN mirror and raises no alert — that's
+    # what the propagation-matrix view is for. Two+ non-reflector sources on
+    # one instance is a genuine name conflict.
+    rows = c.execute(
+        """SELECT rdata, vlan, src_mac, GROUP_CONCAT(DISTINCT src_ip) ips
            FROM answers WHERE rtype='PTR' AND ts > ?
-           GROUP BY rdata HAVING COUNT(DISTINCT src_mac) > 1
-           ORDER BY COUNT(DISTINCT src_mac) DESC LIMIT 20""",
+           GROUP BY rdata, vlan, src_mac""",
         (now - 600,),
-    ):
-        macs = r["macs"].split(",")
-        ips = r["ips"].split(",")
-        real = [m for m in macs if m not in reflectors]
-        pairs = ", ".join(f"{ip}/{m}" for ip, m in zip(ips, macs))
-        if len(real) > 1:
+    ).fetchall()
+    by_inst = {}
+    for r in rows:
+        by_inst.setdefault(r["rdata"], []).append(r)
+    for inst, rs in sorted(by_inst.items()):
+        real = [r for r in rs if r["src_mac"] not in reflectors]
+        if len({r["src_mac"] for r in real}) > 1:
+            pairs = ", ".join(f"{r['ips']}/{r['src_mac']} vlan{r['vlan']}" for r in real)
             out.append({
                 "severity": "high",
                 "kind": "name_conflict",
-                "detail": f"instance '{r['rdata']}' claimed by {len(real)} different devices ({pairs}) — two devices share one friendly name; legitimate in stereo pairs/groups, otherwise a real conflict",
+                "detail": f"instance '{inst}' claimed by {len({r['src_mac'] for r in real})} different devices ({pairs}) — two devices share one friendly name; legitimate in stereo pairs/groups, otherwise a real conflict",
             })
-        elif len(macs) > 1:
-            out.append({
-                "severity": "info",
-                "kind": "reflector_echo",
-                "detail": f"instance '{r['rdata']}' also announced by {pairs} — matches the reflector pattern, so this is your UniFi proxy mirroring the service, not a conflict",
-            })
+            continue
+        for r in rs:
+            if r["src_mac"] in reflectors and any(x["vlan"] == r["vlan"] for x in real):
+                out.append({
+                    "severity": "medium",
+                    "kind": "reflector_loop",
+                    "detail": f"'{inst}' echoed by the reflector (vlan {r['vlan']}, {r['src_mac']}) back onto the VLAN where a device announces it natively — doubles multicast on that segment; known UniFi reflector misbehavior",
+                })
+                break
     return {"alerts": out, "generated_at": now}
 
 
