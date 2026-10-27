@@ -13,6 +13,7 @@ import threading
 import time
 from contextlib import closing
 
+import unifi
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -88,14 +89,45 @@ def init_db():
                 hostname TEXT PRIMARY KEY,
                 addresses TEXT, last_seen REAL
             );
+
+            CREATE TABLE IF NOT EXISTS ssdp_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, sensor_id TEXT, vlan INTEGER,
+                src_ip TEXT, src_mac TEXT, dst_ip TEXT, dport INTEGER,
+                method TEXT, st TEXT, nts TEXT, usn TEXT,
+                location TEXT, server TEXT, mcast INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_ssdp_ts ON ssdp_events(ts);
+            CREATE INDEX IF NOT EXISTS idx_ssdp_usn ON ssdp_events(usn);
+
+            CREATE TABLE IF NOT EXISTS upnp_devices (
+                usn TEXT PRIMARY KEY,
+                sts TEXT, src_ip TEXT, src_mac TEXT,
+                location TEXT, server TEXT,
+                first_seen REAL, last_seen REAL,
+                vlan INTEGER, last_nts TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS goodbyes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, sensor_id TEXT, vlan INTEGER,
+                src_ip TEXT, src_mac TEXT,
+                proto TEXT, what TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_goodbyes_ts ON goodbyes(ts);
             """
         )
+        try:
+            c.execute("ALTER TABLE services ADD COLUMN gone INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         c.commit()
 
 
 @app.on_event("startup")
 def startup():
     init_db()
+    unifi.start()
 
 
 def update_services(c, ts, sensor_id, vlan, answers):
@@ -111,7 +143,7 @@ def update_services(c, ts, sensor_id, vlan, answers):
                    VALUES (?,?,?,?,?,?)
                    ON CONFLICT(instance) DO UPDATE SET
                      last_seen=excluded.last_seen, type=excluded.type,
-                     sensor_id=excluded.sensor_id, vlan=excluded.vlan""",
+                     sensor_id=excluded.sensor_id, vlan=excluded.vlan, gone=0""",
                 (inst, svc_type, ts, ts, sensor_id, vlan),
             )
         elif rtype == "SRV":
@@ -123,7 +155,7 @@ def update_services(c, ts, sensor_id, vlan, answers):
                    VALUES (?,?,?,?,?,?,?)
                    ON CONFLICT(instance) DO UPDATE SET
                      host=excluded.host, port=excluded.port,
-                     last_seen=excluded.last_seen, sensor_id=excluded.sensor_id, vlan=excluded.vlan""",
+                     last_seen=excluded.last_seen, sensor_id=excluded.sensor_id, vlan=excluded.vlan, gone=0""",
                 (inst, target.rstrip("."), port_num, ts, ts, sensor_id, vlan),
             )
         elif rtype == "TXT":
@@ -177,6 +209,37 @@ async def ingest(request: Request):
                         (ts, sensor_id, vlan, ev.get("src_ip"), ev.get("src_mac"), ev.get("dst_ip"), g["group"], g["action"], g["record"]),
                     )
                 continue
+            if ev.get("kind") == "ssdp":
+                c.execute(
+                    "INSERT INTO ssdp_events (ts,sensor_id,vlan,src_ip,src_mac,dst_ip,dport,method,st,nts,usn,location,server,mcast) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (ts, sensor_id, vlan, ev.get("src_ip"), ev.get("src_mac"), ev.get("dst_ip"),
+                     ev.get("dport"), ev.get("method"), ev.get("st"), ev.get("nts"),
+                     ev.get("usn"), ev.get("location"), ev.get("server"),
+                     1 if ev.get("mcast") else 0),
+                )
+                usn = ev.get("usn")
+                if usn:
+                    base = usn.split("::")[0]  # uuid before the service suffix
+                    row = c.execute("SELECT sts FROM upnp_devices WHERE usn=?", (base,)).fetchone()
+                    sts = set(json.loads(row[0])) if row else set()
+                    if ev.get("st"):
+                        sts.add(ev["st"])
+                    c.execute(
+                        """INSERT INTO upnp_devices (usn,sts,src_ip,src_mac,location,server,first_seen,last_seen,vlan,last_nts)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(usn) DO UPDATE SET sts=excluded.sts, src_ip=excluded.src_ip,
+                             src_mac=excluded.src_mac, location=COALESCE(excluded.location, upnp_devices.location),
+                             server=COALESCE(excluded.server, upnp_devices.server),
+                             last_seen=excluded.last_seen, last_nts=excluded.last_nts""",
+                        (base, json.dumps(sorted(sts)), ev.get("src_ip"), ev.get("src_mac"),
+                         ev.get("location"), ev.get("server"), ts, ts, vlan, ev.get("nts")),
+                    )
+                if ev.get("nts") == "ssdp:byebye":
+                    c.execute(
+                        "INSERT INTO goodbyes (ts,sensor_id,vlan,src_ip,src_mac,proto,what) VALUES (?,?,?,?,?,?,?)",
+                        (ts, sensor_id, vlan, ev.get("src_ip"), ev.get("src_mac"), "ssdp", ev.get("st") or usn),
+                    )
+                continue
             is_resp = 1 if ev.get("is_response") else 0
             c.execute(
                 """INSERT INTO packets
@@ -199,6 +262,15 @@ async def ingest(request: Request):
                     "INSERT INTO answers (ts,sensor_id,vlan,src_ip,src_mac,name,rtype,ttl,rdata,section) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (ts, sensor_id, vlan, ev.get("src_ip"), ev.get("src_mac"), a["name"], a["rtype"], a["ttl"], a["rdata"], a["section"]),
                 )
+                # RFC 6762 goodbye: records re-announced with TTL 0
+                if a["ttl"] == 0 and a["rtype"] in ("PTR", "SRV"):
+                    what = a["rdata"] if a["rtype"] == "PTR" else a["name"]
+                    c.execute(
+                        "INSERT INTO goodbyes (ts,sensor_id,vlan,src_ip,src_mac,proto,what) VALUES (?,?,?,?,?,?,?)",
+                        (ts, sensor_id, vlan, ev.get("src_ip"), ev.get("src_mac"), "mdns", what),
+                    )
+                    inst = what.split(" (")[0].rstrip(".") if a["rtype"] == "PTR" else a["name"].rstrip(".")
+                    c.execute("UPDATE services SET gone=1 WHERE instance=?", (inst,))
             update_services(c, ts, sensor_id, vlan, ev.get("answers", []))
         # cheap retention sweep
         cutoff = now - RETENTION_HOURS * 3600
@@ -206,6 +278,8 @@ async def ingest(request: Request):
         c.execute("DELETE FROM questions WHERE ts < ?", (cutoff,))
         c.execute("DELETE FROM answers WHERE ts < ?", (cutoff,))
         c.execute("DELETE FROM igmp_events WHERE ts < ?", (cutoff,))
+        c.execute("DELETE FROM ssdp_events WHERE ts < ?", (cutoff,))
+        c.execute("DELETE FROM goodbyes WHERE ts < ?", (cutoff,))
         c.commit()
     except Exception as e:
         c.rollback()
@@ -270,7 +344,8 @@ def talkers(minutes: int = Query(60, le=1440)):
     total = sum(r["packets"] for r in rows) or 1
     return {
         "talkers": [
-            {**dict(r), "share": round(100 * r["packets"] / total, 1)} for r in rows
+            {**dict(r), "share": round(100 * r["packets"] / total, 1),
+             "client": unifi.lookup(mac=r["src_mac"], ip=r["src_ip"])} for r in rows
         ]
     }
 
@@ -280,7 +355,7 @@ def services():
     c = db()
     rows = c.execute(
         """SELECT s.instance, s.type, s.host, s.port, s.addresses, s.txt,
-                  s.first_seen, s.last_seen, s.vlan
+                  s.first_seen, s.last_seen, s.vlan, s.gone
            FROM services s ORDER BY s.type, s.instance"""
     ).fetchall()
     now = time.time()
@@ -366,7 +441,8 @@ def memberships():
         else:
             left.append(m)
     summary = [
-        {"group": g, "members": len(set(v)), "member_ips": sorted(set(v))}
+        {"group": g, "members": len(set(v)), "member_ips": sorted(set(v)),
+         "members_named": [unifi.lookup(ip=ip) or ip for ip in sorted(set(v))]}
         for g, v in sorted(groups.items())
     ]
     return {"groups": summary, "left": sorted(left, key=lambda x: -x["last_event"])[:50]}
@@ -427,6 +503,53 @@ def alerts():
             "detail": f"instance '{r['rdata']}' advertised by {r['macs']} different devices ({r['ips']}) — likely a hostname/name conflict",
         })
     return {"alerts": out, "generated_at": now}
+
+
+@app.get("/api/ssdp")
+def ssdp(minutes: int = Query(60, le=1440)):
+    """Recent SSDP/UPnP events: M-SEARCH, NOTIFY alive/byebye, responses."""
+    c = db()
+    since = time.time() - minutes * 60
+    rows = c.execute(
+        """SELECT ts, sensor_id, vlan, src_ip, src_mac, dst_ip, dport,
+                  method, st, nts, usn, location, server, mcast
+           FROM ssdp_events WHERE ts > ? ORDER BY ts DESC LIMIT 300""",
+        (since,),
+    ).fetchall()
+    return {"events": [{**dict(r), "client": unifi.lookup(mac=r["src_mac"], ip=r["src_ip"])} for r in rows]}
+
+
+@app.get("/api/upnp")
+def upnp():
+    """UPnP device catalog keyed by USN uuid: what each device advertises,
+    its description URL and server string, and whether it said byebye."""
+    c = db()
+    rows = c.execute("SELECT * FROM upnp_devices ORDER BY src_ip").fetchall()
+    return {
+        "devices": [
+            {**{k: v for k, v in dict(r).items() if k != "sts"},
+             "sts": json.loads(r["sts"]) if r["sts"] else [],
+             "bye": r["last_nts"] == "ssdp:byebye",
+             "client": unifi.lookup(mac=r["src_mac"], ip=r["src_ip"])}
+            for r in rows
+        ]
+    }
+
+
+@app.get("/api/goodbyes")
+def goodbyes(minutes: int = Query(120, le=1440)):
+    """Graceful departures: mDNS TTL=0 records and SSDP ssdp:byebye."""
+    c = db()
+    since = time.time() - minutes * 60
+    rows = c.execute(
+        "SELECT * FROM goodbyes WHERE ts > ? ORDER BY ts DESC LIMIT 200", (since,)
+    ).fetchall()
+    return {"goodbyes": [{**dict(r), "client": unifi.lookup(mac=r["src_mac"], ip=r["src_ip"])} for r in rows]}
+
+
+@app.get("/api/unifi")
+def unifi_status():
+    return unifi.status()
 
 
 # ---------- dashboard ----------

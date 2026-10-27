@@ -42,6 +42,10 @@ IPPROTO_UDP = 17
 IPPROTO_IGMP = 2
 IPPROTO_ICMPV6 = 58
 MDNS_PORT = 5353
+# SSDP runs on UDP 1900 (multicast + unicast responses); Sonos controllers
+# additionally use broadcast UDP 6969 for discovery.
+SSDP_PORTS = (1900, 6969)
+SSDP_MCAST = ("239.255.255.250", "255.255.255.255")
 
 IGMP_TYPES = {0x11: "query", 0x12: "v1_report", 0x16: "v2_report", 0x17: "v2_leave", 0x22: "v3_report"}
 MLD_TYPES = {130: "query", 131: "v1_report", 132: "v1_done", 143: "v2_report"}
@@ -125,6 +129,42 @@ def parse_igmp(data: bytes, l4: int, is_v6: bool):
     return groups
 
 
+def parse_ssdp(payload: bytes):
+    """Parse an SSDP/UPnP datagram (HTTP/1.1-style headers over UDP).
+
+    Returns the interesting fields or None when it doesn't look like SSDP."""
+    try:
+        text = payload.decode("utf-8", "replace")
+    except Exception:
+        return None
+    lines = text.split("\r\n")
+    first = lines[0].strip() if lines else ""
+    if first.startswith("HTTP/"):
+        method = "response"
+    else:
+        m = first.split(" ", 1)[0].upper()
+        if m not in ("M-SEARCH", "NOTIFY", "M-POST", "SUBSCRIBE", "UNSUBSCRIBE"):
+            return None
+        method = m.lower().replace("-", "_")
+    headers = {}
+    for ln in lines[1:]:
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    return {
+        "method": method,
+        "st": headers.get("st") or headers.get("nt"),
+        "nts": headers.get("nts"),
+        "usn": headers.get("usn"),
+        "location": headers.get("location"),
+        "server": headers.get("server"),
+        "man": headers.get("man"),
+        "mx": headers.get("mx"),
+        # Sonos household id — handy to tell multiple Sonos systems apart
+        "rincon": headers.get("x-rincon-household"),
+    }
+
+
 def parse_packet(data: bytes):
     """Extract an mDNS event dict from a raw Ethernet frame, or None."""
     if len(data) < 14:
@@ -176,9 +216,25 @@ def parse_packet(data: bytes):
     if len(data) < udp + 8:
         return None
     sport, dport, ulen = struct.unpack("!HHH", data[udp : udp + 6])
-    if sport != MDNS_PORT and dport != MDNS_PORT:
-        return None
     payload = data[udp + 8 : udp + ulen]
+    if sport != MDNS_PORT and dport != MDNS_PORT:
+        if sport in SSDP_PORTS or dport in SSDP_PORTS:
+            ev = parse_ssdp(payload)
+            if ev is None:
+                return None
+            ev.update({
+                "kind": "ssdp",
+                "src_mac": mac(data[6:12]),
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "sport": sport,
+                "dport": dport,
+                "vlan": vlan,
+                "size": len(payload),
+                "mcast": dst_ip in SSDP_MCAST or dst_ip.lower().startswith("ff0"),
+            })
+            return ev
+        return None
 
     try:
         dns = DNSRecord.parse(payload)

@@ -108,6 +108,11 @@ Set `DB_PATH=/tmp/mdns.db` to keep the demo DB out of the way.
 - **mDNS** (UDP 5353, IPv4+IPv6): queries, responses, service announcements
 - **IGMP/MLD** (IP proto 2 / ICMPv6): membership reports, leaves, and queries —
   the "who joined/left a multicast group" feed, including v2/v3 group records
+- **SSDP/UPnP** (UDP 1900 multicast + unicast, plus Sonos broadcast 1900/6969):
+  M-SEARCH, NOTIFY alive/byebye, and unicast responses — device catalog keyed
+  by USN, with Sonos `X-RINCON` household IDs
+- **Goodbyes**: mDNS TTL=0 records and `ssdp:byebye` — graceful departures vs.
+  devices that vanish silently (shown stale after their records age out)
 
 ## Config
 
@@ -121,14 +126,28 @@ Set `DB_PATH=/tmp/mdns.db` to keep the demo DB out of the way.
 | `CHATTY_PPS` | collector | 5 | pps threshold for chatty alert |
 | `RETENTION_HOURS` | collector | 72 | packet/question/answer retention |
 | `DB_PATH` | collector | /data/mdns.db | SQLite location |
+| `UNIFI_HOST` | collector | – | e.g. `https://192.168.1.1` — enables UniFi enrichment |
+| `UNIFI_API_KEY` | collector | – | UniFi OS API key (read-only) for client names/AP/port |
+| `UNIFI_SITE` | collector | default | controller site name |
+| `UNIFI_POLL_SECONDS` | collector | 60 | how often to refresh the client list |
+
+UniFi enrichment is optional: with `UNIFI_HOST`+`UNIFI_API_KEY` set, the
+collector polls the Network API (`stat/sta`) and labels talkers, group
+members, UPnP devices and goodbyes with each client's UniFi name and
+AP/switch. Without them everything still works, just unlabeled.
+
+## Testing
+
+`tests/` has parser unit tests (`python -m pytest tests/`).
+`docs/TESTING.md` is a full verification plan — lab checks plus real-network
+procedures for Sonos/IoT discovery problems (missing speakers, unanswered
+M-SEARCHes, graceful-vs-crash departures, IGMP membership flaps).
 
 ## Roadmap hooks
 
 - Propagation matrix: correlate service announcements across VLAN sensors to
   verify the UniFi mDNS proxy is actually reflecting each service (and detect
   reflector loops — same packet seen on N VLANs).
-- SSDP/UPnP capture (UDP 1900 + Sonos broadcast discovery 1900/6969).
-- Goodbye-packet tracking (TTL=0 announcements) for device churn visibility.
-- UniFi controller API enrichment: MAC → device name/AP/port, and per-port
-  multicast counters to spot flooding vs. IGMP-snooping confinement.
+- UniFi per-port multicast counters to spot flooding vs. IGMP-snooping
+  confinement (enrichment already pulls client names/AP/port).
 - Query↔response correlation: "device X asked for Y and never saw an answer."

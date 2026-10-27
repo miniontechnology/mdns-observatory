@@ -43,6 +43,9 @@
   .alert { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
   .alert:last-child { border-bottom: none; }
   tr.stale td { opacity: 0.45; }
+  tr.gone td { opacity: 0.45; }
+  .pill.gone { background: #f0525226; color: var(--bad); }
+  .pill.stale-p { background: #f5b94226; color: var(--warn); }
   .pill.join { background: #3ecf8e26; color: var(--good); }
   .pill.leave { background: #f0525226; color: var(--bad); }
   #activity td { font-size: 12px; }
@@ -104,6 +107,30 @@
     </table>
   </div>
 
+  <div class="card">
+    <h2>UPnP / SSDP devices</h2>
+    <table>
+      <thead><tr><th class="wrap">Device (USN)</th><th class="wrap">Services</th><th class="wrap">Location</th><th>Last</th></tr></thead>
+      <tbody id="upnp"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>SSDP activity (1h)</h2>
+    <table>
+      <thead><tr><th>Time</th><th class="wrap">Source</th><th>Method</th><th class="wrap">ST / NT</th><th>NTS</th></tr></thead>
+      <tbody id="ssdp"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Goodbyes — graceful departures (2h)</h2>
+    <table>
+      <thead><tr><th>Time</th><th class="wrap">Device</th><th>Via</th><th class="wrap">What left</th></tr></thead>
+      <tbody id="goodbyes"></tbody>
+    </table>
+  </div>
+
   <div class="card full">
     <h2>Service catalog</h2>
     <table>
@@ -123,6 +150,7 @@
 
 <script>
 const esc = s => (s ?? "").toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const nm = (c, fb) => c && c.name ? `${esc(c.name)} <span class="muted">${c.ap ? '@ '+esc(c.ap)+' ' : ''}(${esc(fb)})</span>` : esc(fb);
 const ago = t => { const s = Date.now()/1000 - t;
   return s < 60 ? `${s|0}s ago` : s < 3600 ? `${s/60|0}m ago` : s < 86400 ? `${s/3600|0}h ago` : `${s/86400|0}d ago`; };
 
@@ -160,10 +188,11 @@ async function j(url) { const r = await fetch(url); return r.json(); }
 
 async function refresh() {
   try {
-    const [sum, ts, tk, sv, qu, al, ac, mb, ig] = await Promise.all([
+    const [sum, ts, tk, sv, qu, al, ac, mb, ig, sd, up, gb] = await Promise.all([
       j('/api/summary'), j('/api/timeseries?minutes=60'), j('/api/talkers?minutes=60'),
       j('/api/services'), j('/api/questions?minutes=30'), j('/api/alerts'),
       j('/api/activity?limit=60'), j('/api/memberships'), j('/api/igmp?minutes=60'),
+      j('/api/ssdp?minutes=60'), j('/api/upnp'), j('/api/goodbyes?minutes=120'),
     ]);
     pps1m.textContent = sum.pps_1m; pps5m.textContent = sum.pps_5m;
     talkers_count.textContent = sum.talkers_5m; nservices.textContent = sum.services_24h;
@@ -173,7 +202,7 @@ async function refresh() {
     draw(ts.series);
 
     document.querySelector('#talkers').innerHTML = tk.talkers.map(t => `<tr>
-      <td class="mono">${esc(t.src_ip)}</td><td class="mono muted">${esc(t.src_mac)}</td>
+      <td class="mono">${nm(t.client, t.src_ip)}</td><td class="mono muted">${esc(t.src_mac)}</td>
       <td>${t.packets}</td><td>${t.share}%</td>
       <td>${t.ttl_not_255 ? `<span class="pill medium">${t.ttl_not_255}</span>` : '0'}</td>
       <td>${t.vlans}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">no traffic yet</td></tr>';
@@ -185,7 +214,7 @@ async function refresh() {
 
     document.querySelector('#groups').innerHTML = mb.groups.map(g => `<tr>
       <td class="mono wrap">${esc(g.group)}</td><td>${g.members}</td>
-      <td class="wrap mono muted">${g.member_ips.map(esc).join(', ')}</td></tr>`).join('')
+      <td class="wrap mono muted">${(g.members_named || g.member_ips).map(m => typeof m === 'object' ? nm(m, m.ip) : esc(m)).join(', ')}</td></tr>`).join('')
       || '<tr><td colspan="3" class="muted">no membership seen yet</td></tr>';
 
     document.querySelector('#igmp').innerHTML = ig.events.slice(0, 25).map(e => `<tr>
@@ -196,12 +225,34 @@ async function refresh() {
       <td class="muted">${esc(e.record)}</td></tr>`).join('')
       || '<tr><td colspan="5" class="muted">no joins/leaves seen yet</td></tr>';
 
-    document.querySelector('#services').innerHTML = sv.services.map(s => `<tr class="${s.stale ? 'stale' : ''}">
-      <td class="wrap">${esc(s.instance)}</td><td class="mono">${esc(s.type)}</td>
+    document.querySelector('#services').innerHTML = sv.services.map(s => `<tr class="${s.gone ? 'gone' : (s.stale ? 'stale' : '')}">
+      <td class="wrap">${esc(s.instance)} ${s.gone ? '<span class="pill gone">goodbye</span>' : (s.stale ? '<span class="pill stale-p">stale</span>' : '')}</td><td class="mono">${esc(s.type)}</td>
       <td class="wrap">${esc(s.host || '')}</td><td>${s.port ?? ''}</td>
       <td class="wrap mono">${s.addresses.map(esc).join('<br>')}</td>
       <td>${s.vlan}</td><td class="muted">${ago(s.last_seen)}</td></tr>`).join('')
       || '<tr><td colspan="7" class="muted">no services seen yet</td></tr>';
+
+    document.querySelector('#upnp').innerHTML = up.devices.map(d => `<tr class="${d.bye ? 'gone' : ''}">
+      <td class="wrap mono">${d.client ? nm(d.client, d.usn) : esc(d.usn)}${d.bye ? ' <span class="pill gone">byebye</span>' : ''}<br><span class="muted mono">${esc(d.src_ip)} · ${esc(d.server || '')}</span></td>
+      <td class="wrap mono muted">${d.sts.map(esc).join('<br>')}</td>
+      <td class="wrap mono muted">${d.location ? `<a href="${esc(d.location)}" style="color:var(--accent)">${esc(d.location)}</a>` : ''}</td>
+      <td class="muted">${ago(d.last_seen)}</td></tr>`).join('')
+      || '<tr><td colspan="4" class="muted">no UPnP devices seen yet</td></tr>';
+
+    document.querySelector('#ssdp').innerHTML = sd.events.slice(0, 30).map(e => `<tr>
+      <td class="muted">${new Date(e.ts*1000).toLocaleTimeString()}</td>
+      <td class="wrap mono">${nm(e.client, e.src_ip)}</td>
+      <td><span class="pill ${e.method === 'm_search' ? 'ok' : (e.nts === 'ssdp:byebye' ? 'leave' : '')}">${esc(e.method)}</span></td>
+      <td class="wrap mono muted">${esc(e.st || '')}</td>
+      <td class="muted mono">${esc(e.nts || '')}</td></tr>`).join('')
+      || '<tr><td colspan="5" class="muted">no SSDP traffic seen yet</td></tr>';
+
+    document.querySelector('#goodbyes').innerHTML = gb.goodbyes.map(g => `<tr>
+      <td class="muted">${new Date(g.ts*1000).toLocaleTimeString()}</td>
+      <td class="wrap mono">${nm(g.client, g.src_ip)}</td>
+      <td><span class="pill leave">${esc(g.proto)}</span></td>
+      <td class="wrap mono">${esc(g.what)}</td></tr>`).join('')
+      || '<tr><td colspan="4" class="muted">no graceful departures seen — devices that vanish without one show as stale</td></tr>';
 
     alerts.innerHTML = al.alerts.map(a => `<div class="alert">
       <span class="pill ${a.severity}">${a.severity}</span>
